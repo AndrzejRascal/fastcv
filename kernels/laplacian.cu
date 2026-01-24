@@ -1,86 +1,69 @@
-#include <cstdio>
+#include <c10/cuda/CUDAException.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include <torch/extension.h>
 
-#include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
+#include "utils.cuh"
 
-#include <stdio.h>
-#include <iostream>
-#include <filesystem>
-#include <opencv2/opencv.hpp>
+__global__ void laplacianKernel(unsigned char* Pin, unsigned char* Pout, int width, int height) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int r = blockIdx.y * blockDim.y + threadIdx.y;
 
-void get_size(int* w, int* h) {
-    cv::Mat image = cv::imread("/content/kocia.jpg");
-     if (image.empty()) {
-        *w = 0;
-        *h = 0;
-        std::cout << "image is empty";
+    if (r >= height || c >= width) {
         return;
-     }
-    *w = image.size().width;
-    *h = image.size().height;
-
-    cv::imwrite("/content/out.jpg", image);
-    cv::waitKey(0);
-    return;
-
-}
-
-template<typename T>
-__global__ void laplacian_kernel(T* input, T* output, int width, int height) {
-
-    __shared__ float tile[18][18];
-
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    int tx = threadIdx.x + 1;
-    int ty = threadIdx.y + 1;
-
-    if (x < width && y < height) {
-        tile[ty][tx] = (float)input[y * width + x];
-
-        if (threadIdx.x == 0 && x > 0) tile[ty][0] = (float)input[y * width + (x - 1)];
-        if (threadIdx.x == blockDim.x - 1 && x < width - 1) tile[ty][17] = (float)input[y * width + (x + 1)];
-        if (threadIdx.y == 0 && y > 0) tile[0][tx] = (float)input[(y - 1) * width + x];
-        if (threadIdx.y == blockDim.y - 1 && y < height - 1) tile[17][tx] = (float)input[(y + 1) * width + x];
     }
 
-    __syncthreads();
+    // [  0,  1,  0 ]
+    // [  1, -4,  1 ]
+    // [  0,  1,  0 ]
+    const int K[3][3] = { { 0, 1, 0 }, { 1, -4, 1 }, { 0, 1, 0 } };
 
-    if (x > 0 && x < width - 1 && y > 0 && y < height - 1) {
-        float res = tile[ty - 1][tx] + tile[ty + 1][tx] +
-                    tile[ty][tx - 1] + tile[ty][tx + 1] -
-                    4.0f * tile[ty][tx];
+    int sum = 0;
 
-        output[y * width + x] = (T)(res + 128.0f);
+    for (int i = -1; i <= 1; i++) {
+        for (int j = -1; j <= 1; j++) {
+
+            int nr = r + i;
+            int nc = c + j;
+
+            if (nr >= 0 && nr < height && nc >= 0 && nc < width) {
+                unsigned char I_in = Pin[nr * width + nc];
+                sum += I_in * K[i + 1][j + 1];
+            }
+        }
     }
+
+    int magnitude = abs(sum);
+
+    unsigned char output_value = (magnitude > 255) ? 255 : (unsigned char)magnitude;
+
+    Pout[r * width + c] = output_value;
 }
 
-int laplacian() {
-    int w, h;
-    get_size(&w, &h);
+torch::Tensor laplacian(torch::Tensor img){
+    TORCH_CHECK(img.device().type() == torch::kCUDA);
+    TORCH_CHECK(img.dtype() == torch::kByte);
 
-    thrust::host_vector<float> h_input(w * h, 1.0f);
+    img = img.contiguous();
 
-    thrust::device_vector<float> d_input = h_input;
-    thrust::device_vector<float> d_output(w * h);
+    const auto height = img.size(0);
+    const auto width = img.size(1);
 
-    dim3 blockSize(16, 16);
-    dim3 gridSize((w + blockSize.x - 1) / blockSize.x, (h + blockSize.y - 1) / blockSize.y);
+    dim3 dimBlock = getOptimalBlockDim(width, height);
+    dim3 dimGrid(cdiv(width, dimBlock.x), cdiv(height, dimBlock.y));
 
-    laplacian_kernel<float><<<gridSize, blockSize>>>(
-        thrust::raw_pointer_cast(d_input.data()),
-        thrust::raw_pointer_cast(d_output.data()),
-        w, h
-    );
+    auto result = torch::empty({height, width},
+                               torch::TensorOptions()
+                                   .dtype(torch::kByte)
+                                   .device(img.device()));
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) printf("launch error: %s\n", cudaGetErrorString(err));
+    laplacianKernel<<<dimGrid, dimBlock, 0, at::cuda::getCurrentCUDAStream()>>>(
+        img.data_ptr<unsigned char>(),
+        result.data_ptr<unsigned char>(),
+        width,
+        height);
 
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) printf("sync error: %s\n", cudaGetErrorString(err));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    thrust::host_vector<float> h_output = d_output;
-    return 0;
+    return result;
 }

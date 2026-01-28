@@ -1,69 +1,154 @@
+// assumes a grayscale image
+// Laplacian (ksize=1) as 3x3 convolution
+//
+// 4-neighborhood kernel:
+// [ 0  1  0
+//   1 -4  1
+//   0  1  0 ]
+//
+// Output: abs(result) clamped to [0,255] (uint8)
+
 #include <c10/cuda/CUDAException.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+#include <thrust/device_ptr.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/copy.h>
+#include <thrust/system/cuda/execution_policy.h>
+#include <utility>
+#include <thrust/reduce.h>
+#include <thrust/functional.h>
+
 #include "utils.cuh"
 
-__global__ void laplacianKernel(unsigned char* Pin, unsigned char* Pout, int width, int height) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    int r = blockIdx.y * blockDim.y + threadIdx.y;
+using u8 = unsigned char;
 
-    if (r >= height || c >= width) {
-        return;
-    }
-
-    // [  0,  1,  0 ]
-    // [  1, -4,  1 ]
-    // [  0,  1,  0 ]
-    const int K[3][3] = { { 0, 1, 0 }, { 1, -4, 1 }, { 0, 1, 0 } };
-
-    int sum = 0;
-
-    for (int i = -1; i <= 1; i++) {
-        for (int j = -1; j <= 1; j++) {
-
-            int nr = r + i;
-            int nc = c + j;
-
-            if (nr >= 0 && nr < height && nc >= 0 && nc < width) {
-                unsigned char I_in = Pin[nr * width + nc];
-                sum += I_in * K[i + 1][j + 1];
-            }
-        }
-    }
-
-    int magnitude = abs(sum);
-
-    unsigned char output_value = (magnitude > 255) ? 255 : (unsigned char)magnitude;
-
-    Pout[r * width + c] = output_value;
+static inline std::pair<int, int> image_hw(const torch::Tensor& img)
+{
+    return { (int)img.size(0), (int)img.size(1) };
 }
 
-torch::Tensor laplacian(torch::Tensor img){
+template<typename T>
+__host__ __device__ __forceinline__ T clamp_value(T v, T lo, T hi)
+{
+    return (v < lo) ? lo : (v > hi ? hi : v);
+}
+
+struct AbsClampToU8
+{
+    __host__ __device__ u8 operator()(int v) const
+    {
+        int a = (v < 0) ? -v : v;
+        a = clamp_value<int>(a, 0, 255);
+        return (u8)a;
+    }
+};
+
+__global__ void laplacianKernel(const u8* in, int* out_sum, int width, int height)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    bool inside_image = (row < height && col < width);
+
+    int block_width  = blockDim.x;
+    int block_height = blockDim.y;
+
+    int shared_width  = block_width  + 2;
+    int shared_height = block_height + 2;
+
+    extern __shared__ u8 shared_tile[];
+
+    int thread_id    = threadIdx.y * block_width + threadIdx.x;
+    int threads_num  = block_width * block_height;
+    int shared_count = shared_width * shared_height;
+
+    for (int shared_id = thread_id; shared_id < shared_count; shared_id += threads_num)
+    {
+        int tile_row = shared_id / shared_width;
+        int tile_col = shared_id - tile_row * shared_width;
+
+        int src_col = (int)(blockIdx.x * block_width)  + (tile_col - 1);
+        int src_row = (int)(blockIdx.y * block_height) + (tile_row - 1);
+
+        u8 pixel = 0;
+        if (src_col >= 0 && src_col < width && src_row >= 0 && src_row < height)
+            pixel = in[src_row * width + src_col];
+
+        shared_tile[shared_id] = pixel;
+    }
+
+    __syncthreads();
+
+    if (!inside_image) return;
+
+    int tile_col = threadIdx.x + 1;
+    int tile_row = threadIdx.y + 1;
+
+    int center = (int)shared_tile[ tile_row * shared_width + tile_col];
+    int up = (int)shared_tile[(tile_row - 1) * shared_width + tile_col];
+    int down = (int)shared_tile[(tile_row + 1) * shared_width + tile_col];
+    int left = (int)shared_tile[ tile_row * shared_width + (tile_col - 1)];
+    int right = (int)shared_tile[ tile_row * shared_width + (tile_col + 1)];
+
+    int sum = -4 * center + up + down + left + right;
+
+    out_sum[row * width + col] = sum;
+}
+
+torch::Tensor laplacian(torch::Tensor img)
+{
     TORCH_CHECK(img.device().type() == torch::kCUDA);
     TORCH_CHECK(img.dtype() == torch::kByte);
 
     img = img.contiguous();
 
-    const auto height = img.size(0);
-    const auto width = img.size(1);
+    auto [height, width] = image_hw(img);
+    const int n = height * width;
 
     dim3 dimBlock = getOptimalBlockDim(width, height);
     dim3 dimGrid(cdiv(width, dimBlock.x), cdiv(height, dimBlock.y));
 
     auto result = torch::empty({height, width},
-                               torch::TensorOptions()
-                                   .dtype(torch::kByte)
-                                   .device(img.device()));
+                               torch::TensorOptions().dtype(torch::kByte).device(img.device()));
 
-    laplacianKernel<<<dimGrid, dimBlock, 0, at::cuda::getCurrentCUDAStream()>>>(
-        img.data_ptr<unsigned char>(),
-        result.data_ptr<unsigned char>(),
+    auto sum_tensor = torch::empty({height, width},
+                                   torch::TensorOptions().dtype(torch::kInt32).device(img.device()));
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t cuda_stream = stream.stream();
+
+    size_t shared_bytes = (dimBlock.x + 2) * (dimBlock.y + 2) * sizeof(u8);
+
+    laplacianKernel<<<dimGrid, dimBlock, shared_bytes, cuda_stream>>>(
+        img.data_ptr<u8>(),
+        sum_tensor.data_ptr<int>(),
         width,
         height);
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    int* sum_ptr = sum_tensor.data_ptr<int>();
+    u8*  out_ptr = result.data_ptr<u8>();
+
+    auto sum_dev = thrust::device_pointer_cast(sum_ptr);
+    auto out_dev = thrust::device_pointer_cast(out_ptr);
+
+    cudaStreamSynchronize(cuda_stream);
+
+    int checksum = thrust::reduce(thrust::device, sum_dev, sum_dev + n, 0, thrust::plus<int>());
+    (void)checksum;
+
+
+    auto fancy_begin = thrust::make_transform_iterator(sum_dev, AbsClampToU8{});
+    auto fancy_end   = fancy_begin + n;
+
+    auto exec_space = thrust::cuda::par.on(cuda_stream);
+
+
+    thrust::copy(exec_space, fancy_begin, fancy_end, out_dev);
 
     return result;
 }

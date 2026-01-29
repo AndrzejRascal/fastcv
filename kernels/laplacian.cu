@@ -33,7 +33,7 @@ __host__ __device__ __forceinline__ T clamp_value(T v, T lo, T hi)
     return (v < lo) ? lo : (v > hi ? hi : v);
 }
 
-struct AbsClampToU8
+struct Clamp
 {
     __host__ __device__ u8 operator()(int v) const
     {
@@ -192,7 +192,7 @@ torch::Tensor laplacian(torch::Tensor img)
     auto sum_dev = thrust::device_pointer_cast(sum_tensor.data_ptr<int>());
     auto out_dev = thrust::device_pointer_cast(result.data_ptr<u8>());
 
-    auto fancy_begin = thrust::make_transform_iterator(sum_dev, AbsClampToU8{});
+    auto fancy_begin = thrust::make_transform_iterator(sum_dev, Clamp{});
     auto fancy_end   = fancy_begin + n;
 
     auto exec_space = thrust::cuda::par.on(cuda_stream);
@@ -238,7 +238,7 @@ torch::Tensor laplacian_compare(torch::Tensor img)
     auto sum_dev = thrust::device_pointer_cast(sum_tensor.data_ptr<int>());
     auto out_dev = thrust::device_pointer_cast(result.data_ptr<u8>());
 
-    auto fancy_begin = thrust::make_transform_iterator(sum_dev, AbsClampToU8{});
+    auto fancy_begin = thrust::make_transform_iterator(sum_dev, Clamp{});
     auto fancy_end   = fancy_begin + n;
 
     auto exec_space = thrust::cuda::par.on(cuda_stream);

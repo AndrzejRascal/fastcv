@@ -7,6 +7,7 @@ torch::Tensor sobel(torch::Tensor img);
 torch::Tensor dilation(torch::Tensor img, int filterSize);
 torch::Tensor erosion(torch::Tensor img, int filterSize);
 torch::Tensor laplacian(torch::Tensor img);
+torch::Tensor laplacian_compare(torch::Tensor img);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
     m.def("rgb2gray", &rgb_to_gray, "rgb to grayscale kernel");
@@ -15,4 +16,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
     m.def("dilate", &dilation, "dilation kernel");
     m.def("erode", &erosion, "erosion kernel");
     m.def("laplacian", &laplacian, "laplacian filter kernel");
+    m.def("laplacian_compare", &laplacian_compare, "laplacian filter comparison kernel");
 }

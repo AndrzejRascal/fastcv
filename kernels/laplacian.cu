@@ -84,10 +84,10 @@ __global__ void laplacianKernel(const u8* in, int* out_sum, int width, int heigh
     int tile_row = threadIdx.y + 1;
 
     int center = (int)shared_tile[ tile_row * shared_width + tile_col];
-    int up     = (int)shared_tile[(tile_row - 1) * shared_width + tile_col];
-    int down   = (int)shared_tile[(tile_row + 1) * shared_width + tile_col];
-    int left   = (int)shared_tile[ tile_row * shared_width + (tile_col - 1)];
-    int right  = (int)shared_tile[ tile_row * shared_width + (tile_col + 1)];
+    int up = (int)shared_tile[(tile_row - 1) * shared_width + tile_col];
+    int down = (int)shared_tile[(tile_row + 1) * shared_width + tile_col];
+    int left = (int)shared_tile[ tile_row * shared_width + (tile_col - 1)];
+    int right = (int)shared_tile[ tile_row * shared_width + (tile_col + 1)];
 
     int sum = -4 * center + up + down + left + right;
 
@@ -96,8 +96,8 @@ __global__ void laplacianKernel(const u8* in, int* out_sum, int width, int heigh
 
 static inline void compare_reduce_thrust_vs_cub(const torch::Tensor& sum_tensor, cudaStream_t cuda_stream)
 {
-    TORCH_CHECK(sum_tensor.is_cuda(), "sum_tensor must be CUDA tensor");
-    TORCH_CHECK(sum_tensor.dtype() == torch::kInt32, "sum_tensor must be int32");
+    TORCH_CHECK(sum_tensor.is_cuda());
+    TORCH_CHECK(sum_tensor.dtype() == torch::kInt32);
     auto t = sum_tensor.contiguous();
     const int n = (int)t.numel();
 

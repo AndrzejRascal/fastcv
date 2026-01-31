@@ -94,69 +94,6 @@ __global__ void laplacianKernel(const u8* in, int* out_sum, int width, int heigh
     out_sum[row * width + col] = sum;
 }
 
-static inline void compare_reduce_thrust_vs_cub(const torch::Tensor& sum_tensor, cudaStream_t cuda_stream)
-{
-    TORCH_CHECK(sum_tensor.is_cuda());
-    TORCH_CHECK(sum_tensor.dtype() == torch::kInt32);
-    auto t = sum_tensor.contiguous();
-    const int n = (int)t.numel();
-
-    auto sum_dev = thrust::device_pointer_cast(t.data_ptr<int>());
-
-    cudaEvent_t t0, t1;
-    cudaEventCreate(&t0);
-    cudaEventCreate(&t1);
-
-    cudaEventRecord(t0, cuda_stream);
-    long long thrust_checksum = thrust::reduce(
-        thrust::cuda::par.on(cuda_stream),
-        sum_dev, sum_dev + n,
-        0LL, thrust::plus<long long>()
-    );
-    cudaEventRecord(t1, cuda_stream);
-    cudaEventSynchronize(t1);
-    float thrust_ms = 0.0f;
-    cudaEventElapsedTime(&thrust_ms, t0, t1);
-
-    size_t temp_bytes = 0;
-    auto cub_out = torch::empty({1}, torch::TensorOptions().dtype(torch::kInt64).device(t.device()));
-
-    cub::DeviceReduce::Sum(nullptr, temp_bytes,
-                           t.data_ptr<int>(),
-                           cub_out.data_ptr<long long>(),
-                           n,
-                           cuda_stream);
-
-    auto cub_temp = torch::empty({(long long)temp_bytes},
-                                 torch::TensorOptions().dtype(torch::kUInt8).device(t.device()));
-
-    cudaEventRecord(t0, cuda_stream);
-    cub::DeviceReduce::Sum(cub_temp.data_ptr(), temp_bytes,
-                           t.data_ptr<int>(),
-                           cub_out.data_ptr<long long>(),
-                           n,
-                           cuda_stream);
-    cudaEventRecord(t1, cuda_stream);
-    cudaEventSynchronize(t1);
-    float cub_ms = 0.0f;
-    cudaEventElapsedTime(&cub_ms, t0, t1);
-
-    long long cub_checksum = 0;
-    cudaMemcpyAsync(&cub_checksum, cub_out.data_ptr<long long>(), sizeof(long long),
-                    cudaMemcpyDeviceToHost, cuda_stream);
-    cudaStreamSynchronize(cuda_stream);
-
-    cudaEventDestroy(t0);
-    cudaEventDestroy(t1);
-
-    TORCH_CHECK(thrust_checksum == cub_checksum,
-                "Checksum mismatch: Thrust=", thrust_checksum,
-                " CUB=", cub_checksum);
-
-    std::printf("[laplacian_compare] Thrust reduce: %.3f ms | CUB reduce: %.3f ms | checksum: %lld\n",
-                thrust_ms, cub_ms, thrust_checksum);
-}
-
 torch::Tensor laplacian(torch::Tensor img)
 {
     TORCH_CHECK(img.device().type() == torch::kCUDA);
@@ -188,52 +125,6 @@ torch::Tensor laplacian(torch::Tensor img)
         height);
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    auto sum_dev = thrust::device_pointer_cast(sum_tensor.data_ptr<int>());
-    auto out_dev = thrust::device_pointer_cast(result.data_ptr<u8>());
-
-    auto fancy_begin = thrust::make_transform_iterator(sum_dev, Clamp{});
-    auto fancy_end   = fancy_begin + n;
-
-    auto exec_space = thrust::cuda::par.on(cuda_stream);
-    thrust::copy(exec_space, fancy_begin, fancy_end, out_dev);
-
-    return result;
-}
-
-torch::Tensor laplacian_compare(torch::Tensor img)
-{
-    TORCH_CHECK(img.device().type() == torch::kCUDA);
-    TORCH_CHECK(img.dtype() == torch::kByte);
-
-    img = img.contiguous();
-
-    auto [height, width] = image_hw(img);
-    const int n = height * width;
-
-    dim3 dimBlock = getOptimalBlockDim(width, height);
-    dim3 dimGrid(cdiv(width, dimBlock.x), cdiv(height, dimBlock.y));
-
-    auto result = torch::empty({height, width},
-                               torch::TensorOptions().dtype(torch::kByte).device(img.device()));
-
-    auto sum_tensor = torch::empty({height, width},
-                                   torch::TensorOptions().dtype(torch::kInt32).device(img.device()));
-
-    auto stream = at::cuda::getCurrentCUDAStream();
-    cudaStream_t cuda_stream = stream.stream();
-
-    size_t shared_bytes = (dimBlock.x + 2) * (dimBlock.y + 2) * sizeof(u8);
-
-    laplacianKernel<<<dimGrid, dimBlock, shared_bytes, cuda_stream>>>(
-        img.data_ptr<u8>(),
-        sum_tensor.data_ptr<int>(),
-        width,
-        height);
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    compare_reduce_thrust_vs_cub(sum_tensor, cuda_stream);
 
     auto sum_dev = thrust::device_pointer_cast(sum_tensor.data_ptr<int>());
     auto out_dev = thrust::device_pointer_cast(result.data_ptr<u8>());

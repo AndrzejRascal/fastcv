@@ -29,16 +29,8 @@ def benchmark_laplacian(sizes=[1024, 2048, 4096], runs=50):
         end = time.perf_counter()
         fc_time = (end - start) / runs * 1000
 
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        for _ in range(runs):
-            _ = fastcv.laplacian_compare(img_torch)
-        torch.cuda.synchronize()
-        end = time.perf_counter()
-        fc_comp_time = (end - start) / runs * 1000
-
-        results.append((size, cv_time, fc_time, fc_comp_time))
-        print(f"OpenCV (CPU): {cv_time:.4f} ms | fastcv (CUDA): {fc_time:.4f} ms | fastcv (Compare): {fc_comp_time:.4f} ms")
+        results.append((size, cv_time, fc_time))
+        print(f"OpenCV (CPU): {cv_time:.4f} ms | fastcv (CUDA): {fc_time:.4f} ms")
 
     return results
 
@@ -46,6 +38,6 @@ def benchmark_laplacian(sizes=[1024, 2048, 4096], runs=50):
 if __name__ == "__main__":
     results = benchmark_laplacian()
     print("\n=== Final Results: Laplacian ===")
-    print("Size\t\tOpenCV (CPU)\tfastcv (CUDA)\tfastcv (Compare)")
-    for size, cv_time, fc_time, fc_comp_time in results:
-        print(f"{size}x{size}\t{cv_time:.4f} ms\t{fc_time:.4f} ms\t{fc_comp_time:.4f} ms")
+    print("Size\t\tOpenCV (CPU)\tfastcv (CUDA)")
+    for size, cv_time, fc_time in results:
+        print(f"{size}x{size}\t{cv_time:.4f} ms\t{fc_time:.4f} ms")
